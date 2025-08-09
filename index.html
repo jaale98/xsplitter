@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>X Thread Splitter – 280-char Chunks</title>
+  <style>
+    :root { --fg:#111; --bg:#fff; --muted:#666; --border:#ddd; --accent:#0a84ff; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; color:var(--fg); background:var(--bg); margin: 0; }
+    header { padding: 16px 20px; border-bottom:1px solid var(--border); position: sticky; top: 0; background: var(--bg); }
+    h1 { margin:0; font-size: 18px; }
+    main { padding: 16px 20px 80px; max-width: 1000px; margin: 0 auto; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 880px) { .row { grid-template-columns: 1fr 1fr; } }
+
+    textarea, input, button { font: inherit; }
+    textarea.input { width: 100%; min-height: 220px; padding: 12px; border:1px solid var(--border); border-radius:12px; resize: vertical; }
+
+    .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .controls label { font-size: 14px; color: var(--muted); }
+    .controls input[type="number"] { width: 90px; padding: 6px 8px; border:1px solid var(--border); border-radius: 10px; }
+    .controls input[type="checkbox"] { transform: translateY(1px); }
+
+    .btn { padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border); background: #f6f7f8; cursor: pointer; }
+    .btn.primary { background: var(--accent); color: white; border-color: var(--accent); }
+    .btn:disabled { opacity: .55; cursor: not-allowed; }
+
+    .out { margin-top: 18px; display: grid; gap: 12px; }
+
+    .chunk { border:1px solid var(--border); border-radius: 12px; overflow: hidden; }
+    .chunk header { display:flex; align-items:center; justify-content: space-between; gap: 12px; padding: 8px 10px; background:#fafafa; border-bottom:1px solid var(--border); position: static; }
+    .chunk header .meta { font-size: 12px; color: var(--muted); }
+    .chunk header .count.over { color: #b00020; font-weight: 600; }
+    .chunk pre { margin: 0; padding: 12px; white-space: pre-wrap; word-wrap: break-word; background: white; }
+
+    .footer { position: fixed; left:0; right:0; bottom:0; background: rgba(255,255,255,.96); border-top:1px solid var(--border); padding: 10px 20px; display:flex; gap:10px; align-items:center; justify-content: space-between; backdrop-filter: blur(6px); }
+    .footer .info { color: var(--muted); font-size: 13px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>✂️ X Thread Splitter (no word breaks, ~280 chars)</h1>
+  </header>
+
+  <main>
+    <div class="row">
+      <section>
+        <label for="in" class="mono" style="display:block; margin-bottom:6px; color: var(--muted);">Paste your text</label>
+        <textarea id="in" class="input" placeholder="Paste or type your long text here…"></textarea>
+
+        <div class="controls" style="margin-top:10px;">
+          <label class="mono">Limit:
+            <input id="limit" type="number" min="40" max="400" value="280" />
+          </label>
+          <label class="mono"><input id="addCounters" type="checkbox" /> Add 1/N counters</label>
+          <label class="mono"><input id="trimLines" type="checkbox" checked /> Trim leading spaces at chunk start</label>
+          <button id="split" class="btn primary">Split</button>
+          <button id="copyAll" class="btn" disabled>Copy all</button>
+        </div>
+      </section>
+
+      <section>
+        <div id="stats" class="mono" style="color:var(--muted); font-size: 13px; margin-top: 4px;">No chunks yet.</div>
+        <div id="out" class="out"></div>
+      </section>
+    </div>
+  </main>
+
+  <div class="footer">
+    <div class="info mono">Rules: never split a word • no chunk starts with a space • aim for ≤ limit where possible</div>
+    <div class="info mono">Tip: Click a chunk to copy it.</div>
+  </div>
+
+<script>
+(function(){
+  const input = document.getElementById('in');
+  const out = document.getElementById('out');
+  const splitBtn = document.getElementById('split');
+  const copyAllBtn = document.getElementById('copyAll');
+  const stats = document.getElementById('stats');
+  const limitEl = document.getElementById('limit');
+  const addCountersEl = document.getElementById('addCounters');
+  const trimLinesEl = document.getElementById('trimLines');
+
+  // --- Core helpers --------------------------------------------------------
+  function splitBase(text, limit, { trimStart } = { trimStart: true }){
+    const chunks = [];
+    let i = 0;
+    const len = text.length;
+
+    while(i < len){
+      let end = Math.min(i + limit, len);
+
+      if(end < len){
+        // Prefer breaking at the last whitespace within the window
+        const slice = text.slice(i, end);
+        let breakAt = -1;
+        for(let j = slice.length - 1; j >= 0; j--){
+          if(/\s/.test(slice[j])){ breakAt = j; break; }
+        }
+        if(breakAt !== -1){
+          end = i + breakAt + 1; // include the space in current chunk
+        } else {
+          // Long word spanning the boundary: extend forward to next whitespace
+          let k = end;
+          while(k < len && !/\s/.test(text[k])) k++;
+          end = (k < len) ? (k + 1) : len;
+        }
+      }
+
+      let chunk = text.slice(i, end);
+      if(trimStart) chunk = chunk.replace(/^\s+/, ''); // never start with space
+      chunk = chunk.replace(/\s+$/, '');                // cosmetic trailing trim
+
+      chunks.push(chunk);
+      i = end;
+    }
+    return chunks;
+  }
+
+  // Two-pass (iterative) split that accounts for 1/N counters so we don't overflow
+  function splitWithCounters(text, limit, { trimStart } = { trimStart: true }){
+    // Initial naive split (no counters) just to estimate N
+    let chunks = splitBase(text, limit, { trimStart });
+
+    for(let iter = 0; iter < 5; iter++){
+      const N = chunks.length || 1;
+      let i = 0; const len = text.length; let idx = 0;
+      const next = [];
+
+      while(i < len){
+        // Prefix for this chunk (space after counter)
+        const prefix = `${idx+1}/${N} `;
+        const cap = Math.max(1, limit - prefix.length);
+
+        let end = Math.min(i + cap, len);
+        if(end < len){
+          const slice = text.slice(i, end);
+          let breakAt = -1;
+          for(let j = slice.length - 1; j >= 0; j--){
+            if(/\s/.test(slice[j])) { breakAt = j; break; }
+          }
+          if(breakAt !== -1){
+            end = i + breakAt + 1;
+          } else {
+            let k = end;
+            while(k < len && !/\s/.test(text[k])) k++;
+            end = (k < len) ? (k + 1) : len;
+          }
+        }
+
+        let body = text.slice(i, end);
+        if(trimStart) body = body.replace(/^\s+/, '');
+        body = body.replace(/\s+$/, '');
+
+        next.push(prefix + body);
+        i = end; idx++;
+      }
+
+      // If N stabilized, we're good
+      if(next.length === N){
+        chunks = next; break;
+      }
+      chunks = next; // try again with new N
+    }
+
+    return chunks;
+  }
+
+  function render(chunks, limit){
+    out.innerHTML = '';
+    stats.textContent = chunks.length ? `Created ${chunks.length} chunk(s). Click a chunk to copy. Chunks over the limit are shown in red.` : 'No chunks yet.';
+    copyAllBtn.disabled = chunks.length === 0;
+
+    chunks.forEach((text, idx) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'chunk';
+
+      const head = document.createElement('header');
+      const meta = document.createElement('div');
+      meta.className = 'meta mono';
+      meta.textContent = `Chunk ${idx+1}`;
+
+      const count = document.createElement('div');
+      count.className = 'count mono';
+      count.textContent = `${text.length}/${limit}`;
+      if(text.length > limit) count.classList.add('over');
+
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'btn';
+      copyBtn.textContent = 'Copy';
+      copyBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await navigator.clipboard.writeText(text);
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => copyBtn.textContent = 'Copy', 900);
+      });
+
+      head.appendChild(meta);
+      head.appendChild(count);
+      head.appendChild(copyBtn);
+
+      const pre = document.createElement('pre');
+      pre.textContent = text;
+      pre.addEventListener('click', async () => {
+        await navigator.clipboard.writeText(text);
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => copyBtn.textContent = 'Copy', 900);
+      });
+
+      wrap.appendChild(head);
+      wrap.appendChild(pre);
+      out.appendChild(wrap);
+    });
+  }
+
+  function doSplit(){
+    const text = input.value || '';
+    const limit = Math.max(1, Math.min(10000, Number(limitEl.value) || 280));
+    const trimStart = !!trimLinesEl.checked;
+
+    const chunks = addCountersEl.checked
+      ? splitWithCounters(text, limit, { trimStart })
+      : splitBase(text, limit, { trimStart });
+
+    render(chunks, limit);
+  }
+
+  // Wire up events. Changing any control re-splits immediately
+  splitBtn.addEventListener('click', doSplit);
+  limitEl.addEventListener('change', doSplit);
+  addCountersEl.addEventListener('change', doSplit);
+  trimLinesEl.addEventListener('change', doSplit);
+  input.addEventListener('input', () => { /* keep typing; user clicks Split to render */ });
+
+  copyAllBtn.addEventListener('click', async () => {
+    const preBlocks = [...out.querySelectorAll('pre')];
+    const joined = preBlocks.map(p => p.textContent).join('\n\n');
+    await navigator.clipboard.writeText(joined);
+    copyAllBtn.textContent = 'Copied!';
+    setTimeout(() => copyAllBtn.textContent = 'Copy all', 900);
+  });
+})();
+</script>
+</body>
+</html>
